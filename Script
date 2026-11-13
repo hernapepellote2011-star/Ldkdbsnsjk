@@ -1,0 +1,815 @@
+--[[
+	SUPER RING PARTS v6
+	Original: Yumm (ScriptBlox) · Edición: lukas · Rediseño v6
+	- Menú blanco y negro, letra monoespaciada, esquinas suaves
+	- Ring Parts (anillo de partes) con radio ajustable
+	- AGARRAR OBJETO (palanca con destello de 120 capas):
+	    * mitad derecha de la pantalla = zona de arrastre (la cámara no se mueve ahí)
+	    * mitad izquierda = cámara normal; toca un objeto para seleccionarlo
+	    * cruz azul sobre el objeto + rayo azul suave desde tu personaje
+	- Gravedad del objeto: botón ON/OFF + slider (0-200 %) que bloquea la cámara mientras lo usas
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
+local LocalPlayer = Players.LocalPlayer
+
+local env = (getgenv and getgenv()) or _G
+if env.__SuperRingV6 then pcall(env.__SuperRingV6) end
+
+------------------------------------------------------------------
+-- Estilo
+------------------------------------------------------------------
+local FONT = Enum.Font.RobotoMono
+local C = {
+	bg = Color3.fromRGB(8, 8, 8),
+	panel = Color3.fromRGB(20, 20, 20),
+	line = Color3.fromRGB(70, 70, 70),
+	white = Color3.fromRGB(240, 240, 240),
+	gray = Color3.fromRGB(150, 150, 150),
+	blue = Color3.fromRGB(80, 160, 255),
+}
+local R = 4 -- esquinas: suaves pero visibles
+
+local conns = {}
+local function bind(signal, fn)
+	local c = signal:Connect(fn)
+	conns[#conns + 1] = c
+	return c
+end
+
+local function new(class, props, parent)
+	local o = Instance.new(class)
+	for k, v in pairs(props) do o[k] = v end
+	o.Parent = parent
+	return o
+end
+local function corner(o, r) return new("UICorner", { CornerRadius = UDim.new(0, r or R) }, o) end
+local function stroke(o, color, transp, thick)
+	return new("UIStroke", { Color = color or C.white, Transparency = transp or 0.6, Thickness = thick or 1 }, o)
+end
+
+------------------------------------------------------------------
+-- Estado
+------------------------------------------------------------------
+local ringOn = false
+local radius, height, rotSpeed, attraction = 50, 100, 0.5, 1000
+local grabOn = false
+local gravOn, gravLevel = true, 100
+local padMode = "plano" -- "plano" | "altura"
+
+local held = nil -- { part, grip, ap, ao, hl }
+local mods = {} -- [part] = { cc, force, gatt }
+
+-- widgets que la lógica actualiza (se crean más abajo)
+local statusLbl, padHint, cross, crossRing, pad
+
+------------------------------------------------------------------
+-- Física / utilidades
+------------------------------------------------------------------
+local sethp = sethiddenproperty or set_hidden_property or set_hidden_prop
+local function claimSim()
+	pcall(function()
+		LocalPlayer.ReplicationFocus = workspace
+		if sethp then
+			sethp(LocalPlayer, "SimulationRadius", math.huge)
+		else
+			LocalPlayer.SimulationRadius = math.huge
+		end
+	end)
+end
+
+local function getRoot()
+	local c = LocalPlayer.Character
+	return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local holder = new("Folder", { Name = "SR6" }, workspace)
+local target = new("Part", {
+	Name = "Target", Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
+	Transparency = 1, Size = Vector3.new(1, 1, 1),
+}, holder)
+local tAtt = new("Attachment", {}, target)
+
+-- rayo azul suave (núcleo + halo)
+local function makeBeam(width, t0, t1)
+	return new("Beam", {
+		Color = ColorSequence.new(C.blue),
+		Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, t0), NumberSequenceKeypoint.new(0.5, (t0 + t1) / 2),
+			NumberSequenceKeypoint.new(1, t1),
+		}),
+		Width0 = width, Width1 = width, FaceCamera = true, LightEmission = 1, Segments = 1, Enabled = false,
+	}, holder)
+end
+local beamCore = makeBeam(0.12, 0.8, 0.35)
+local beamHalo = makeBeam(0.6, 0.95, 0.88)
+
+local function inCharacter(part)
+	local m = part.Parent
+	while m and m ~= workspace do
+		if m:FindFirstChildOfClass("Humanoid") then return true end
+		m = m.Parent
+	end
+	return false
+end
+
+local function isLoose(part)
+	return part:IsA("BasePart") and not part.Anchored and part:IsDescendantOf(workspace)
+		and not part:IsDescendantOf(holder) and not inCharacter(part)
+end
+
+local function rootAtt()
+	local root = getRoot()
+	if not root then return nil end
+	local a = root:FindFirstChild("SR6Att")
+	if not a then a = new("Attachment", { Name = "SR6Att" }, root) end
+	return a
+end
+
+local function setStatus(text, hint)
+	if statusLbl then statusLbl.Text = text end
+	if padHint then padHint.Text = hint or (held and "ARRASTRA AQUI PARA MOVER" or "TOCA UN OBJETO\n(MITAD IZQUIERDA)") end
+end
+
+------------------------------------------------------------------
+-- Cámara (se bloquea mientras usas el slider)
+------------------------------------------------------------------
+local camLock
+local function lockCamera(on)
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	if on then
+		if camLock then return end
+		camLock = { t = cam.CameraType }
+		cam.CameraType = Enum.CameraType.Scriptable
+	elseif camLock then
+		cam.CameraType = camLock.t
+		camLock = nil
+	end
+end
+
+------------------------------------------------------------------
+-- Gravedad del objeto
+------------------------------------------------------------------
+local function getRec(part)
+	local r = mods[part]
+	if not r then
+		r = { cc = part.CanCollide }
+		mods[part] = r
+	end
+	return r
+end
+
+local function applyGravity(part)
+	if not part or not part.Parent then return end
+	local rec = getRec(part)
+	local mult = gravOn and (gravLevel / 100) or 0
+	if math.abs(mult - 1) < 0.01 then
+		if rec.force then rec.force:Destroy() rec.force = nil end
+		if rec.gatt then rec.gatt:Destroy() rec.gatt = nil end
+		return
+	end
+	if not rec.force then
+		rec.gatt = new("Attachment", { Name = "SR6Grav" }, part)
+		rec.force = new("VectorForce", {
+			Attachment0 = rec.gatt, RelativeTo = Enum.ActuatorRelativeTo.World, ApplyAtCenterOfMass = true,
+		}, part)
+	end
+	rec.force.Force = Vector3.new(0, part.AssemblyMass * workspace.Gravity * (1 - mult), 0)
+end
+
+local function restoreMods()
+	for part, rec in pairs(mods) do
+		pcall(function()
+			if rec.force then rec.force:Destroy() end
+			if rec.gatt then rec.gatt:Destroy() end
+			if part.Parent and rec.cc ~= nil and not (held and held.part == part) then
+				part.CanCollide = rec.cc
+			end
+		end)
+	end
+	mods = {}
+end
+
+------------------------------------------------------------------
+-- Agarrar objeto
+------------------------------------------------------------------
+local function release()
+	if not held then return end
+	local h = held
+	held = nil
+	for _, o in ipairs({ h.ap, h.ao, h.grip, h.hl }) do
+		pcall(function() o:Destroy() end)
+	end
+	local rec = mods[h.part]
+	if h.part.Parent and rec and rec.cc ~= nil then h.part.CanCollide = rec.cc end
+	if rec and not rec.force then mods[h.part] = nil end
+	beamCore.Enabled, beamHalo.Enabled = false, false
+	beamCore.Attachment1, beamHalo.Attachment1 = nil, nil
+	if cross then cross.Visible = false end
+	setStatus("OBJETO: ninguno")
+end
+
+local function grab(part)
+	release()
+	if not isLoose(part) then return end
+	claimSim()
+	getRec(part)
+	local grip = new("Attachment", { Name = "SR6Grip" }, part)
+	target.CFrame = part.CFrame
+	local ap = new("AlignPosition", {
+		Mode = Enum.PositionAlignmentMode.TwoAttachment, Attachment0 = grip, Attachment1 = tAtt,
+		MaxForce = math.huge, MaxVelocity = math.huge, Responsiveness = 60, RigidityEnabled = false,
+	}, part)
+	local ao = new("AlignOrientation", {
+		Mode = Enum.OrientationAlignmentMode.TwoAttachment, Attachment0 = grip, Attachment1 = tAtt,
+		MaxTorque = math.huge, Responsiveness = 40, RigidityEnabled = false,
+	}, part)
+	local hl = new("Highlight", {
+		Adornee = part, FillColor = C.blue, FillTransparency = 0.8,
+		OutlineColor = C.blue, OutlineTransparency = 0.2,
+	}, holder)
+	part.CanCollide = false
+	part.AssemblyLinearVelocity = Vector3.zero
+	held = { part = part, grip = grip, ap = ap, ao = ao, hl = hl }
+	beamCore.Attachment1, beamHalo.Attachment1 = grip, grip
+	beamCore.Enabled, beamHalo.Enabled = true, true
+	applyGravity(part)
+	setStatus("OBJETO: " .. part.Name)
+end
+
+local function pick(pos)
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local ray = cam:ScreenPointToRay(pos.X, pos.Y)
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ex = { holder }
+	if LocalPlayer.Character then ex[#ex + 1] = LocalPlayer.Character end
+	params.FilterDescendantsInstances = ex
+	local res = workspace:Raycast(ray.Origin, ray.Direction * 2000, params)
+	if not res then return end
+	if isLoose(res.Instance) then
+		grab(res.Instance)
+	else
+		setStatus("NO MOVIBLE: " .. res.Instance.Name)
+	end
+end
+
+local function movePad(delta)
+	if not held then return end
+	local cam = workspace.CurrentCamera
+	local cf = cam.CFrame
+	local right = Vector3.new(cf.RightVector.X, 0, cf.RightVector.Z)
+	right = right.Magnitude > 0.01 and right.Unit or Vector3.xAxis
+	local look = Vector3.new(cf.LookVector.X, 0, cf.LookVector.Z)
+	look = look.Magnitude > 0.01 and look.Unit or Vector3.zAxis * -1
+	local dist = (cf.Position - target.Position).Magnitude
+	local k = 0.05 * math.clamp(dist / 15, 0.6, 5)
+	local move = right * (delta.X * k)
+	if padMode == "plano" then
+		move = move + look * (-delta.Y * k)
+	else
+		move = move + Vector3.new(0, -delta.Y * k, 0)
+	end
+	local newPos = target.Position + move
+	local root = getRoot()
+	if root and (newPos - root.Position).Magnitude > 300 then
+		newPos = root.Position + (newPos - root.Position).Unit * 300
+	end
+	target.Position = newPos
+end
+
+------------------------------------------------------------------
+-- Ring Parts
+------------------------------------------------------------------
+local ringSaved, ringConn = {}, nil
+
+local function ringAdd(p)
+	if ringSaved[p] == nil and isLoose(p) then
+		ringSaved[p] = { props = p.CustomPhysicalProperties, cc = p.CanCollide }
+		p.CustomPhysicalProperties = PhysicalProperties.new(0, 0, 0, 0, 0)
+		p.CanCollide = false
+	end
+end
+
+local function setRing(on)
+	ringOn = on
+	if on then
+		claimSim()
+		for _, d in ipairs(workspace:GetDescendants()) do ringAdd(d) end
+		ringConn = workspace.DescendantAdded:Connect(ringAdd)
+	else
+		if ringConn then ringConn:Disconnect() ringConn = nil end
+		for p, s in pairs(ringSaved) do
+			if p.Parent then
+				p.CustomPhysicalProperties = s.props
+				p.CanCollide = s.cc
+			end
+		end
+		ringSaved = {}
+	end
+end
+
+------------------------------------------------------------------
+-- GUI
+------------------------------------------------------------------
+local function getParent()
+	if gethui then
+		local ok, g = pcall(gethui)
+		if ok and g then return g end
+	end
+	local ok = pcall(function()
+		local t = Instance.new("Folder")
+		t.Parent = CoreGui
+		t:Destroy()
+	end)
+	if ok then return CoreGui end
+	return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+local gui = new("ScreenGui", {
+	Name = "SuperRingV6", ResetOnSpawn = false, DisplayOrder = 1000,
+	ZIndexBehavior = Enum.ZIndexBehavior.Sibling, IgnoreGuiInset = false,
+}, getParent())
+
+-- botón genérico
+local function mkButton(parent, text, size, pos, textSize)
+	local b = new("TextButton", {
+		Text = text, Font = FONT, TextSize = textSize or 12, TextColor3 = C.white,
+		BackgroundColor3 = C.panel, AutoButtonColor = false, Size = size, Position = pos or UDim2.new(),
+	}, parent)
+	corner(b)
+	local s = stroke(b, C.white, 0.6, 1)
+	b.MouseButton1Down:Connect(function() s.Transparency = 0 end)
+	b.MouseButton1Up:Connect(function() s.Transparency = 0.6 end)
+	b.MouseLeave:Connect(function() s.Transparency = 0.6 end)
+	return b
+end
+
+local function mkLabel(parent, text, size, color, pos, sz, align)
+	return new("TextLabel", {
+		BackgroundTransparency = 1, Text = text, Font = FONT, TextSize = size or 12, TextColor3 = color or C.white,
+		TextXAlignment = align or Enum.TextXAlignment.Left, Position = pos or UDim2.new(),
+		Size = sz or UDim2.fromScale(1, 1), TextWrapped = true,
+	}, parent)
+end
+
+-- interruptor [ ON ] / [ OFF ]
+local function mkSwitch(parent, initial, cb)
+	local b = mkButton(parent, "", UDim2.fromOffset(64, 24), UDim2.new(1, -64, 0.5, -12))
+	local state = initial
+	local function paint()
+		b.Text = state and "[ ON ]" or "[ OFF ]"
+		b.BackgroundColor3 = state and C.white or C.panel
+		b.TextColor3 = state and C.bg or C.white
+	end
+	b.MouseButton1Click:Connect(function()
+		state = not state
+		paint()
+		cb(state)
+	end)
+	paint()
+	return { get = function() return state end }
+end
+
+-- PALANCA con destello blanco de 100+ capas
+local function mkLever(parent, layers, cb)
+	local box = new("Frame", { BackgroundTransparency = 1, Size = UDim2.fromOffset(64, 64) }, parent)
+
+	local glow = new("CanvasGroup", {
+		BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(150, 150), GroupTransparency = 1, ZIndex = 1,
+	}, box)
+	local gscale = new("UIScale", { Scale = 1 }, glow)
+	for i = 1, layers do
+		local d = 22 + (i / layers) * 120
+		local l = new("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.fromOffset(d, d), BackgroundColor3 = Color3.new(1, 1, 1),
+			BackgroundTransparency = 0.992, BorderSizePixel = 0,
+		}, glow)
+		corner(l, 999)
+	end
+
+	local base = new("Frame", {
+		BackgroundColor3 = C.bg, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(32, 54),
+		Size = UDim2.fromOffset(30, 10), ZIndex = 3, BorderSizePixel = 0,
+	}, box)
+	corner(base, 2)
+	stroke(base, C.white, 0.1, 1)
+
+	local stick = new("Frame", {
+		BackgroundColor3 = C.white, AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.fromOffset(32, 52),
+		Size = UDim2.fromOffset(4, 32), Rotation = -38, BorderSizePixel = 0, ZIndex = 4,
+	}, box)
+	stroke(stick, C.bg, 0, 1)
+	local knob = new("Frame", {
+		BackgroundColor3 = C.white, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0, 0),
+		Size = UDim2.fromOffset(14, 14), BorderSizePixel = 0, ZIndex = 5,
+	}, stick)
+	corner(knob, 999)
+	stroke(knob, C.bg, 0, 2)
+
+	local hit = new("TextButton", { Text = "", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 6 }, box)
+
+	local state, pulse, token = false, nil, 0
+	local function set(on)
+		state = on
+		token += 1
+		local my = token
+		if pulse then pulse:Cancel() pulse = nil end
+		TweenService:Create(stick, TweenInfo.new(0.28, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+			{ Rotation = on and 38 or -38 }):Play()
+		if on then
+			-- destello: aparece fuerte y se asienta
+			glow.GroupTransparency = 0
+			gscale.Scale = 0.4
+			TweenService:Create(gscale, TweenInfo.new(0.45, Enum.EasingStyle.Quint, Enum.EasingDirection.Out),
+				{ Scale = 1 }):Play()
+			local settle = TweenService:Create(glow, TweenInfo.new(0.45, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+				{ GroupTransparency = 0.3 })
+			settle.Completed:Connect(function(st)
+				if my == token and state and st == Enum.PlaybackState.Completed then
+					pulse = TweenService:Create(glow, TweenInfo.new(1.2, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true),
+						{ GroupTransparency = 0.55 })
+					pulse:Play()
+				end
+			end)
+			settle:Play()
+		else
+			TweenService:Create(glow, TweenInfo.new(0.3), { GroupTransparency = 1 }):Play()
+			TweenService:Create(gscale, TweenInfo.new(0.3), { Scale = 0.6 }):Play()
+		end
+	end
+	hit.MouseButton1Click:Connect(function()
+		set(not state)
+		cb(state)
+	end)
+	return box
+end
+
+-- slider (la cámara se bloquea mientras lo arrastras)
+local function mkSlider(parent, minV, maxV, init, fmt, cb)
+	local f = new("Frame", { BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1) }, parent)
+	local lbl = mkLabel(f, "", 11, C.gray, UDim2.new(), UDim2.new(1, 0, 0, 14))
+	local track = new("Frame", {
+		BackgroundColor3 = C.line, BorderSizePixel = 0, Position = UDim2.new(0, 0, 0, 26), Size = UDim2.new(1, 0, 0, 4),
+	}, f)
+	corner(track, 2)
+	local fill = new("Frame", { BackgroundColor3 = C.white, BorderSizePixel = 0, Size = UDim2.fromScale(0, 1) }, track)
+	corner(fill, 2)
+	local knob = new("Frame", {
+		BackgroundColor3 = C.white, BorderSizePixel = 0, AnchorPoint = Vector2.new(0.5, 0.5),
+		Size = UDim2.fromOffset(12, 18), Position = UDim2.fromScale(0, 0.5),
+	}, track)
+	corner(knob, 2)
+	stroke(knob, C.bg, 0, 2)
+	local hit = new("TextButton", {
+		Text = "", BackgroundTransparency = 1, Position = UDim2.new(0, -8, 0, 12), Size = UDim2.new(1, 16, 0, 32),
+	}, f)
+
+	local value = init
+	local enabled = true
+	local function render()
+		local a = (value - minV) / (maxV - minV)
+		fill.Size = UDim2.fromScale(a, 1)
+		knob.Position = UDim2.fromScale(a, 0.5)
+		lbl.Text = fmt(value)
+	end
+	local function setFromX(x)
+		local a = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+		value = math.floor(minV + a * (maxV - minV) + 0.5)
+		render()
+		cb(value)
+	end
+
+	local dragging, dragInput = false, nil
+	hit.InputBegan:Connect(function(input)
+		if not enabled then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragInput = true, input
+			lockCamera(true)
+			setFromX(input.Position.X)
+		end
+	end)
+	bind(UIS.InputChanged, function(input)
+		if dragging and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
+			setFromX(input.Position.X)
+		end
+	end)
+	bind(UIS.InputEnded, function(input)
+		if dragging and (input == dragInput
+			or (dragInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+			dragging = false
+			lockCamera(false)
+		end
+	end)
+	render()
+	return {
+		setEnabled = function(on)
+			enabled = on
+			fill.BackgroundColor3 = on and C.white or C.line
+			knob.BackgroundColor3 = on and C.white or C.gray
+			lbl.TextColor3 = on and C.gray or C.line
+		end,
+	}
+end
+
+------------------------------------------------------------------
+-- Ventana principal
+------------------------------------------------------------------
+local W = 272
+local win = new("Frame", {
+	AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 8, 0.5, 0), Size = UDim2.fromOffset(W, 0),
+	AutomaticSize = Enum.AutomaticSize.Y, BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true,
+	ClipsDescendants = true, ZIndex = 10,
+}, gui)
+corner(win)
+stroke(win, C.white, 0.15, 1)
+new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder }, win)
+
+local header = new("TextButton", {
+	Text = "", AutoButtonColor = false, BackgroundColor3 = C.white, BorderSizePixel = 0,
+	Size = UDim2.new(1, 0, 0, 30), LayoutOrder = 0,
+}, win)
+mkLabel(header, "SUPER RING v6", 13, C.bg, UDim2.fromOffset(10, 0), UDim2.new(1, -70, 1, 0))
+local minBtn = mkButton(header, "-", UDim2.fromOffset(24, 20), UDim2.new(1, -56, 0.5, -10))
+local closeBtn = mkButton(header, "x", UDim2.fromOffset(24, 20), UDim2.new(1, -28, 0.5, -10))
+for _, b in ipairs({ minBtn, closeBtn }) do
+	b.BackgroundColor3 = C.bg
+	b.TextColor3 = C.white
+end
+
+local body = new("Frame", {
+	BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1,
+}, win)
+new("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, 4) }, body)
+new("UIPadding", {
+	PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12), PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 10),
+}, body)
+
+local order = 0
+local function row(h)
+	order += 1
+	return new("Frame", { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, h), LayoutOrder = order }, body)
+end
+local function section(text)
+	local r = row(14)
+	mkLabel(r, "// " .. text, 11, C.gray)
+end
+
+-- ANILLO
+section("ANILLO DE PARTES")
+do
+	local r = row(26)
+	mkLabel(r, "Ring Parts", 12, C.white, UDim2.new(), UDim2.new(1, -70, 1, 0))
+	mkSwitch(r, false, function(v) setRing(v) end)
+
+	local r2 = row(26)
+	mkLabel(r2, "Radio", 12, C.white, UDim2.new(), UDim2.new(1, -120, 1, 0))
+	local minus = mkButton(r2, "-", UDim2.fromOffset(26, 24), UDim2.new(1, -112, 0.5, -12), 14)
+	local val = mkLabel(r2, tostring(radius), 12, C.white, UDim2.new(1, -82, 0, 0), UDim2.fromOffset(52, 26), Enum.TextXAlignment.Center)
+	local plus = mkButton(r2, "+", UDim2.fromOffset(26, 24), UDim2.new(1, -26, 0.5, -12), 14)
+	minus.MouseButton1Click:Connect(function()
+		radius = math.max(0, radius - 5)
+		val.Text = tostring(radius)
+	end)
+	plus.MouseButton1Click:Connect(function()
+		radius = math.min(10000, radius + 5)
+		val.Text = tostring(radius)
+	end)
+end
+
+-- AGARRAR OBJETO
+section("AGARRAR OBJETO")
+do
+	local r = row(64)
+	local lever = mkLever(r, 120, function(on)
+		grabOn = on
+		pad.Visible = on
+		if on then
+			claimSim()
+			setStatus("OBJETO: ninguno")
+		else
+			release()
+			restoreMods()
+			lockCamera(false)
+		end
+	end)
+	lever.Position = UDim2.fromOffset(0, 0)
+
+	local info = new("Frame", { BackgroundTransparency = 1, Position = UDim2.fromOffset(76, 0), Size = UDim2.new(1, -76, 1, 0) }, r)
+	mkLabel(info, "PALANCA: ON/OFF", 11, C.white, UDim2.new(), UDim2.new(1, 0, 0, 14))
+	statusLbl = mkLabel(info, "OBJETO: ninguno", 11, C.gray, UDim2.fromOffset(0, 16), UDim2.new(1, 0, 0, 14))
+	statusLbl.TextTruncate = Enum.TextTruncate.AtEnd
+	local rel = mkButton(info, "SOLTAR", UDim2.new(1, 0, 0, 24), UDim2.fromOffset(0, 38), 11)
+	rel.MouseButton1Click:Connect(function() release() end)
+end
+
+-- GRAVEDAD
+section("GRAVEDAD DEL OBJETO")
+local gravSlider
+do
+	local r = row(26)
+	mkLabel(r, "Gravedad", 12, C.white, UDim2.new(), UDim2.new(1, -70, 1, 0))
+	mkSwitch(r, true, function(v)
+		gravOn = v
+		if gravSlider then gravSlider.setEnabled(v) end
+		if held then applyGravity(held.part) end
+	end)
+
+	local r2 = row(40)
+	gravSlider = mkSlider(r2, 0, 200, 100, function(v) return ("NIVEL: %d%%"):format(v) end, function(v)
+		gravLevel = v
+		if held and gravOn then applyGravity(held.part) end
+	end)
+end
+
+do
+	local r = row(12)
+	mkLabel(r, "Original: Yumm · Edit: lukas", 10, C.line)
+end
+
+-- minimizar / cerrar
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	minBtn.Text = minimized and "+" or "-"
+end)
+
+-- arrastrar la ventana
+do
+	local dragging, dragInput, startPos, startIn = false, nil, nil, nil
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragInput, startPos, startIn = true, input, win.Position, input.Position
+		end
+	end)
+	bind(UIS.InputChanged, function(input)
+		if dragging and (input == dragInput or input.UserInputType == Enum.UserInputType.MouseMovement) then
+			local d = input.Position - startIn
+			win.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+	bind(UIS.InputEnded, function(input)
+		if dragging and (input == dragInput
+			or (dragInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1)) then
+			dragging = false
+		end
+	end)
+end
+
+------------------------------------------------------------------
+-- Zona de arrastre (mitad derecha) y puntero en cruz azul
+------------------------------------------------------------------
+pad = new("TextButton", {
+	Text = "", AutoButtonColor = false, Visible = false, BackgroundColor3 = C.bg, BackgroundTransparency = 0.8,
+	BorderSizePixel = 0, Position = UDim2.fromScale(0.5, 0.12), Size = UDim2.fromScale(0.5, 0.56), ZIndex = 1,
+}, gui)
+corner(pad)
+stroke(pad, C.white, 0.7, 1)
+padHint = mkLabel(pad, "TOCA UN OBJETO\n(MITAD IZQUIERDA)", 12, C.gray, UDim2.new(), UDim2.fromScale(1, 1), Enum.TextXAlignment.Center)
+padHint.ZIndex = 1
+local modeBtn = mkButton(pad, "[ MODO: PLANO ]", UDim2.fromOffset(140, 24), UDim2.fromOffset(8, 8), 11)
+modeBtn.ZIndex = 2
+modeBtn.MouseButton1Click:Connect(function()
+	padMode = padMode == "plano" and "altura" or "plano"
+	modeBtn.Text = padMode == "plano" and "[ MODO: PLANO ]" or "[ MODO: ALTURA ]"
+end)
+
+cross = new("Frame", {
+	BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(40, 40),
+	Visible = false, ZIndex = 5,
+}, gui)
+for _, v in ipairs({ { UDim2.new(0.5, -1, 0, 4), UDim2.fromOffset(2, 12) }, { UDim2.new(0.5, -1, 1, -16), UDim2.fromOffset(2, 12) },
+	{ UDim2.new(0, 4, 0.5, -1), UDim2.fromOffset(12, 2) }, { UDim2.new(1, -16, 0.5, -1), UDim2.fromOffset(12, 2) } }) do
+	new("Frame", { BackgroundColor3 = C.blue, BackgroundTransparency = 0.25, BorderSizePixel = 0, Position = v[1], Size = v[2], ZIndex = 5 }, cross)
+end
+crossRing = new("Frame", {
+	BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+	Size = UDim2.fromOffset(30, 30), ZIndex = 5,
+}, cross)
+corner(crossRing, 999)
+stroke(crossRing, C.blue, 0.55, 2)
+
+------------------------------------------------------------------
+-- Entradas: tocar para seleccionar (izquierda) y arrastrar (derecha)
+------------------------------------------------------------------
+local taps = {}
+bind(UIS.InputBegan, function(input, gp)
+	if gp or not grabOn then return end
+	local t = input.UserInputType
+	if t ~= Enum.UserInputType.Touch and t ~= Enum.UserInputType.MouseButton1 then return end
+	if input.Position.X >= gui.AbsoluteSize.X * 0.5 then return end
+	taps[input] = { p = input.Position, t = os.clock() }
+end)
+
+local padInput
+pad.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+		padInput = input
+	end
+end)
+
+bind(UIS.InputChanged, function(input)
+	if padInput and held then
+		if input == padInput
+			or (padInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement) then
+			movePad(input.Delta)
+		end
+	end
+end)
+
+bind(UIS.InputEnded, function(input)
+	if input == padInput
+		or (padInput and padInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseButton1) then
+		padInput = nil
+	end
+	local s = taps[input]
+	taps[input] = nil
+	if s and grabOn and (input.Position - s.p).Magnitude < 14 and os.clock() - s.t < 0.4 then
+		pick(Vector2.new(input.Position.X, input.Position.Y))
+	end
+end)
+
+------------------------------------------------------------------
+-- Bucle principal
+------------------------------------------------------------------
+bind(RunService.Heartbeat, function()
+	if ringOn or held or next(mods) then claimSim() end
+
+	if held and not held.part.Parent then release() end
+
+	if ringOn then
+		local root = getRoot()
+		if root then
+			local c = root.Position
+			for p in pairs(ringSaved) do
+				if not p.Parent then
+					ringSaved[p] = nil
+				elseif not p.Anchored and not (held and held.part == p) then
+					local pos = p.Position
+					local dist = (Vector3.new(pos.X, c.Y, pos.Z) - c).Magnitude
+					local ang = math.atan2(pos.Z - c.Z, pos.X - c.X) + math.rad(rotSpeed)
+					local r = math.min(radius, dist)
+					local tp = Vector3.new(
+						c.X + math.cos(ang) * r,
+						c.Y + height * math.abs(math.sin((pos.Y - c.Y) / height)),
+						c.Z + math.sin(ang) * r
+					)
+					local d = tp - pos
+					if d.Magnitude > 0.05 then p.AssemblyLinearVelocity = d.Unit * attraction end
+				end
+			end
+		end
+	end
+end)
+
+bind(RunService.RenderStepped, function()
+	local cam = workspace.CurrentCamera
+	if held and held.part.Parent and cam then
+		local ra = rootAtt()
+		if ra then
+			beamCore.Attachment0 = ra
+			beamHalo.Attachment0 = ra
+		end
+		local p, on = cam:WorldToScreenPoint(held.part.Position)
+		cross.Visible = on
+		if on then
+			cross.Position = UDim2.fromOffset(p.X, p.Y)
+			local s = 30 + math.sin(os.clock() * 4) * 3
+			crossRing.Size = UDim2.fromOffset(s, s)
+		end
+	elseif cross then
+		cross.Visible = false
+	end
+end)
+
+------------------------------------------------------------------
+-- Cierre / limpieza
+------------------------------------------------------------------
+local function cleanup()
+	pcall(setRing, false)
+	pcall(release)
+	pcall(restoreMods)
+	lockCamera(false)
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	pcall(function() gui:Destroy() end)
+	pcall(function() holder:Destroy() end)
+	local root = getRoot()
+	if root then
+		local a = root:FindFirstChild("SR6Att")
+		if a then a:Destroy() end
+	end
+	env.__SuperRingV6 = nil
+end
+env.__SuperRingV6 = cleanup
+closeBtn.MouseButton1Click:Connect(cleanup)
+
+claimSim()
